@@ -26,6 +26,7 @@ import {
   LoadSketchRequest,
 } from './cli-protocol/cc/arduino/cli/commands/v1/commands_pb';
 import { Deferred } from '@theia/core/lib/common/promise-util';
+import { escapeRegExpCharacters } from '@theia/core/lib/common/strings';
 import { ServiceError } from './service-error';
 import {
   IsTempSketch,
@@ -33,6 +34,7 @@ import {
   TempSketchPrefix,
 } from './is-temp-sketch';
 import { join } from 'path';
+import { ErrnoException } from './utils/errors';
 
 const RecentSketches = 'recent-sketches.json';
 const DefaultIno = `void setup() {
@@ -157,7 +159,7 @@ export class SketchesServiceImpl
       const sketchName = segments[segments.length - 2];
       const sketchFilename = segments[segments.length - 1];
       const sketchFileExtension = segments[segments.length - 1].replace(
-        new RegExp(sketchName),
+        new RegExp(escapeRegExpCharacters(sketchName)),
         ''
       );
       if (sketchFileExtension !== '.ino' && sketchFileExtension !== '.pde') {
@@ -187,6 +189,13 @@ export class SketchesServiceImpl
   }
 
   async loadSketch(uri: string): Promise<SketchWithDetails> {
+    return this.doLoadSketch(uri);
+  }
+
+  private async doLoadSketch(
+    uri: string,
+    detectInvalidSketchNameError = true
+  ): Promise<SketchWithDetails> {
     const { client, instance } = await this.coreClient;
     const req = new LoadSketchRequest();
     const requestSketchPath = FileUri.fsPath(uri);
@@ -201,17 +210,19 @@ export class SketchesServiceImpl
         if (err) {
           let rejectWith: unknown = err;
           if (isNotFoundError(err)) {
-            const invalidMainSketchFilePath = await isInvalidSketchNameError(
-              err,
-              requestSketchPath
-            );
-            if (invalidMainSketchFilePath) {
-              rejectWith = SketchesError.InvalidName(
-                err.details,
-                FileUri.create(invalidMainSketchFilePath).toString()
+            rejectWith = SketchesError.NotFound(err.details, uri);
+            // detecting the invalid sketch name error is not for free as it requires multiple filesystem access.
+            if (detectInvalidSketchNameError) {
+              const invalidMainSketchFilePath = await isInvalidSketchNameError(
+                err,
+                requestSketchPath
               );
-            } else {
-              rejectWith = SketchesError.NotFound(err.details, uri);
+              if (invalidMainSketchFilePath) {
+                rejectWith = SketchesError.InvalidName(
+                  err.details,
+                  FileUri.create(invalidMainSketchFilePath).toString()
+                );
+              }
             }
           }
           reject(rejectWith);
@@ -278,7 +289,7 @@ export class SketchesServiceImpl
         );
       }
     } catch (err) {
-      if ('code' in err && err.code === 'ENOENT') {
+      if (ErrnoException.isENOENT(err)) {
         this.logger.debug(
           `<<< '${RecentSketches}' does not exist yet. This is normal behavior. Falling back to empty data.`
         );
@@ -317,7 +328,7 @@ export class SketchesServiceImpl
 
       let sketch: Sketch | undefined = undefined;
       try {
-        sketch = await this.loadSketch(uri);
+        sketch = await this.doLoadSketch(uri, false);
         this.logger.debug(
           `Loaded sketch ${JSON.stringify(
             sketch
@@ -390,7 +401,7 @@ export class SketchesServiceImpl
       )) {
         let sketch: SketchWithDetails | undefined = undefined;
         try {
-          sketch = await this.loadSketch(uri);
+          sketch = await this.doLoadSketch(uri, false);
         } catch {}
         if (!sketch) {
           needsUpdate = true;
@@ -413,14 +424,14 @@ export class SketchesServiceImpl
 
   async cloneExample(uri: string): Promise<Sketch> {
     const [sketch, parentPath] = await Promise.all([
-      this.loadSketch(uri),
+      this.doLoadSketch(uri, false),
       this.createTempFolder(),
     ]);
     const destinationUri = FileUri.create(
       path.join(parentPath, sketch.name)
     ).toString();
     const copiedSketchUri = await this.copy(sketch, { destinationUri });
-    return this.loadSketch(copiedSketchUri);
+    return this.doLoadSketch(copiedSketchUri, false);
   }
 
   async createNewSketch(): Promise<Sketch> {
@@ -477,7 +488,7 @@ export class SketchesServiceImpl
       fs.mkdir(sketchDir, { recursive: true }),
     ]);
     await fs.writeFile(sketchFile, inoContent, { encoding: 'utf8' });
-    return this.loadSketch(FileUri.create(sketchDir).toString());
+    return this.doLoadSketch(FileUri.create(sketchDir).toString(), false);
   }
 
   /**
@@ -528,7 +539,7 @@ export class SketchesServiceImpl
     uri: string
   ): Promise<SketchWithDetails | undefined> {
     try {
-      const sketch = await this.loadSketch(uri);
+      const sketch = await this.doLoadSketch(uri, false);
       return sketch;
     } catch (err) {
       if (SketchesError.NotFound.is(err) || SketchesError.InvalidName.is(err)) {
@@ -553,7 +564,7 @@ export class SketchesServiceImpl
     }
     // Nothing to do when source and destination are the same.
     if (sketch.uri === destinationUri) {
-      await this.loadSketch(sketch.uri); // Sanity check.
+      await this.doLoadSketch(sketch.uri, false); // Sanity check.
       return sketch.uri;
     }
 
@@ -574,7 +585,10 @@ export class SketchesServiceImpl
             if (oldPath !== newPath) {
               await fs.rename(oldPath, newPath);
             }
-            await this.loadSketch(FileUri.create(destinationPath).toString()); // Sanity check.
+            await this.doLoadSketch(
+              FileUri.create(destinationPath).toString(),
+              false
+            ); // Sanity check.
             resolve();
           } catch (e) {
             reject(e);
@@ -596,7 +610,7 @@ export class SketchesServiceImpl
   }
 
   async archive(sketch: Sketch, destinationUri: string): Promise<string> {
-    await this.loadSketch(sketch.uri); // sanity check
+    await this.doLoadSketch(sketch.uri, false); // sanity check
     const { client } = await this.coreClient;
     const archivePath = FileUri.fsPath(destinationUri);
     // The CLI cannot override existing archives, so we have to wipe it manually: https://github.com/arduino/arduino-cli/issues/1160
@@ -647,7 +661,7 @@ export class SketchesServiceImpl
 
   private async exists(pathLike: string): Promise<boolean> {
     try {
-      await fs.access(pathLike, constants.R_OK | constants.W_OK);
+      await fs.access(pathLike, constants.R_OK);
       return true;
     } catch {
       return false;
@@ -666,7 +680,7 @@ export class SketchesServiceImpl
 
       return this.tryParse(raw);
     } catch (err) {
-      if ('code' in err && err.code === 'ENOENT') {
+      if (ErrnoException.isENOENT(err)) {
         return undefined;
       }
       throw err;
@@ -695,7 +709,7 @@ export class SketchesServiceImpl
             });
             this.inoContent.resolve(inoContent);
           } catch (err) {
-            if ('code' in err && err.code === 'ENOENT') {
+            if (ErrnoException.isENOENT(err)) {
               // Ignored. The custom `.ino` blueprint file is optional.
             } else {
               throw err;
@@ -720,60 +734,68 @@ function isNotFoundError(err: unknown): err is ServiceError {
 
 /**
  * Tries to detect whether the error was caused by an invalid main sketch file name.
- * IDE2 should handle gracefully when there is an invalid sketch folder name. See the [spec](https://arduino.github.io/arduino-cli/latest/sketch-specification/#sketch-root-folder) for details.
- * The CLI does not have error codes (https://github.com/arduino/arduino-cli/issues/1762), so IDE2 parses the error message and tries to guess it.
+ * IDE2 should handle gracefully when there is an invalid sketch folder name.
+ * See the [spec](https://arduino.github.io/arduino-cli/latest/sketch-specification/#sketch-root-folder) for details.
+ * The CLI does not have error codes (https://github.com/arduino/arduino-cli/issues/1762),
+ * IDE2 cannot parse the error message (https://github.com/arduino/arduino-cli/issues/1968#issuecomment-1306936142)
+ * so it checks if a sketch even if it's invalid can be discovered from the requested path.
  * Nothing guarantees that the invalid existing main sketch file still exits by the time client performs the sketch move.
  */
 async function isInvalidSketchNameError(
   cliErr: unknown,
   requestSketchPath: string
 ): Promise<string | undefined> {
-  if (isNotFoundError(cliErr)) {
-    const ino = requestSketchPath.endsWith('.ino');
-    if (ino) {
-      const sketchFolderPath = path.dirname(requestSketchPath);
-      const sketchName = path.basename(sketchFolderPath);
-      const pattern = `${invalidSketchNameErrorRegExpPrefix}${path.join(
-        sketchFolderPath,
-        `${sketchName}.ino`
-      )}`.replace(/\\/g, '\\\\'); // make windows path separator with \\ to have a valid regexp.
-      if (new RegExp(pattern, 'i').test(cliErr.details)) {
-        try {
-          await fs.access(requestSketchPath);
-          return requestSketchPath;
-        } catch {
-          return undefined;
-        }
-      }
-    } else {
-      try {
-        const resources = await fs.readdir(requestSketchPath, {
-          withFileTypes: true,
-        });
-        return (
-          resources
-            .filter((resource) => resource.isFile())
-            .filter((resource) => resource.name.endsWith('.ino'))
-            // A folder might contain multiple sketches. It's OK to ick the first one as IDE2 cannot do much,
-            // but ensure a deterministic behavior as `readdir(3)` does not guarantee an order. Sort them.
-            .sort(({ name: left }, { name: right }) =>
-              left.localeCompare(right)
-            )
-            .map(({ name }) => name)
-            .map((name) => path.join(requestSketchPath, name))[0]
-        );
-      } catch (err) {
-        if ('code' in err && err.code === 'ENOTDIR') {
-          return undefined;
-        }
-        throw err;
-      }
-    }
-  }
-  return undefined;
+  return isNotFoundError(cliErr)
+    ? isAccessibleSketchPath(requestSketchPath)
+    : undefined;
 }
-const invalidSketchNameErrorRegExpPrefix =
-  '.*: main file missing from sketch: ';
+
+/**
+ * The `path` argument is valid, if accessible and either pointing to a `.ino` file,
+ * or it's a directory, and one of the files in the directory is an `.ino` file.
+ *
+ * `undefined` if `path` was pointing to neither an accessible sketch file nor a sketch folder.
+ *
+ * The sketch folder name and sketch file name can be different. This method is not sketch folder name compliant.
+ * The `path` must be an absolute, resolved path. This method does not handle EACCES (Permission denied) errors.
+ *
+ * When `fallbackToInvalidFolderPath` is `true`, and the `path` is an accessible folder without any sketch files,
+ * this method returns with the `path` argument instead of `undefined`.
+ */
+export async function isAccessibleSketchPath(
+  path: string,
+  fallbackToInvalidFolderPath = false
+): Promise<string | undefined> {
+  let stats: Stats | undefined = undefined;
+  try {
+    stats = await fs.stat(path);
+  } catch (err) {
+    if (ErrnoException.isENOENT(err)) {
+      return undefined;
+    }
+    throw err;
+  }
+  if (!stats) {
+    return undefined;
+  }
+  if (stats.isFile()) {
+    return path.endsWith('.ino') ? path : undefined;
+  }
+  const entries = await fs.readdir(path, { withFileTypes: true });
+  const sketchFilename = entries
+    .filter((entry) => entry.isFile() && entry.name.endsWith('.ino'))
+    .map(({ name }) => name)
+    // A folder might contain multiple sketches. It's OK to pick the first one as IDE2 cannot do much,
+    // but ensure a deterministic behavior as `readdir(3)` does not guarantee an order. Sort them.
+    .sort((left, right) => left.localeCompare(right))[0];
+  if (sketchFilename) {
+    return join(path, sketchFilename);
+  }
+  // If no sketches found in the folder, but the folder exists,
+  // return with the path of the empty folder and let IDE2's frontend
+  // figure out the workspace root.
+  return fallbackToInvalidFolderPath ? path : undefined;
+}
 
 /*
  * When a new sketch is created, add a suffix to distinguish it

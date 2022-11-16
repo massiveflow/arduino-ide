@@ -9,7 +9,7 @@ import {
 import { fork } from 'child_process';
 import { AddressInfo } from 'net';
 import { join, isAbsolute, resolve } from 'path';
-import { promises as fs, Stats } from 'fs';
+import { promises as fs } from 'fs';
 import { MaybePromise } from '@theia/core/lib/common/types';
 import { ElectronSecurityToken } from '@theia/core/lib/electron-common/electron-token';
 import { FrontendApplicationConfig } from '@theia/application-package/lib/application-props';
@@ -27,7 +27,8 @@ import {
   CLOSE_PLOTTER_WINDOW,
   SHOW_PLOTTER_WINDOW,
 } from '../../common/ipc-communication';
-import isValidPath = require('is-valid-path');
+import { ErrnoException } from '../../node/utils/errors';
+import { isAccessibleSketchPath } from '../../node/sketches-service-impl';
 
 app.commandLine.appendSwitch('disable-http-cache');
 
@@ -145,7 +146,10 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
         event.preventDefault();
         const resolvedPath = await this.resolvePath(path, cwd);
         if (resolvedPath) {
-          const sketchFolderPath = await this.isValidSketchPath(resolvedPath);
+          const sketchFolderPath = await isAccessibleSketchPath(
+            resolvedPath,
+            true
+          );
           if (sketchFolderPath) {
             this.openFilePromise.reject(new InterruptWorkspaceRestoreError());
             await this.openSketch(sketchFolderPath);
@@ -158,56 +162,10 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
     }
   }
 
-  /**
-   * The `path` argument is valid, if accessible and either pointing to a `.ino` file,
-   * or it's a directory, and one of the files in the directory is an `.ino` file.
-   *
-   * If `undefined`, `path` was pointing to neither an accessible sketch file nor a sketch folder.
-   *
-   * The sketch folder name and sketch file name can be different. This method is not sketch folder name compliant.
-   * The `path` must be an absolute, resolved path.
-   */
-  private async isValidSketchPath(path: string): Promise<string | undefined> {
-    let stats: Stats | undefined = undefined;
-    try {
-      stats = await fs.stat(path);
-    } catch (err) {
-      if ('code' in err && err.code === 'ENOENT') {
-        return undefined;
-      }
-      throw err;
-    }
-    if (!stats) {
-      return undefined;
-    }
-    if (stats.isFile() && path.endsWith('.ino')) {
-      return path;
-    }
-    try {
-      const entries = await fs.readdir(path, { withFileTypes: true });
-      const sketchFilename = entries
-        .filter((entry) => entry.isFile() && entry.name.endsWith('.ino'))
-        .map(({ name }) => name)
-        .sort((left, right) => left.localeCompare(right))[0];
-      if (sketchFilename) {
-        return join(path, sketchFilename);
-      }
-      // If no sketches found in the folder, but the folder exists,
-      // return with the path of the empty folder and let IDE2's frontend
-      // figure out the workspace root.
-      return path;
-    } catch (err) {
-      throw err;
-    }
-  }
-
   private async resolvePath(
     maybePath: string,
     cwd: string
   ): Promise<string | undefined> {
-    if (!isValidPath(maybePath)) {
-      return undefined;
-    }
     if (isAbsolute(maybePath)) {
       return maybePath;
     }
@@ -215,7 +173,7 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
       const resolved = await fs.realpath(resolve(cwd, maybePath));
       return resolved;
     } catch (err) {
-      if ('code' in err && err.code === 'ENOENT') {
+      if (ErrnoException.isENOENT(err)) {
         return undefined;
       }
       throw err;
@@ -256,7 +214,10 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
         if (!resolvedPath) {
           continue;
         }
-        const sketchFolderPath = await this.isValidSketchPath(resolvedPath);
+        const sketchFolderPath = await isAccessibleSketchPath(
+          resolvedPath,
+          true
+        );
         if (sketchFolderPath) {
           workspace.file = sketchFolderPath;
           if (this.isTempSketch.is(workspace.file)) {
@@ -287,7 +248,7 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
       if (!resolvedPath) {
         continue;
       }
-      const sketchFolderPath = await this.isValidSketchPath(resolvedPath);
+      const sketchFolderPath = await isAccessibleSketchPath(resolvedPath, true);
       if (sketchFolderPath) {
         path = sketchFolderPath;
         break;
@@ -355,10 +316,7 @@ export class ElectronMainApplication extends TheiaElectronMainApplication {
     argv: string[],
     cwd: string
   ): Promise<void> {
-    if (
-      !os.isOSX &&
-      (await this.launchFromArgs({ cwd, argv, secondInstance: true }))
-    ) {
+    if (await this.launchFromArgs({ cwd, argv, secondInstance: true })) {
       // Application has received a file in its arguments
       return;
     }
